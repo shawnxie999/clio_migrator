@@ -22,11 +22,82 @@ wait(boost::asio::steady_timer& timer, std::string const reason)
     BOOST_LOG_TRIVIAL(info) << "Done";
 }
 
+std::variant<std::monostate, std::string, Status>
+getURI(Backend::NFT const& dbResponse, Backend::CassandraBackend& backend,  boost::asio::yield_context& yield)
+{
+    // Fetch URI from ledger
+    // The correct page will be > bookmark and <= last. We need to calculate
+    // the first possible page however, since bookmark is not guaranteed to
+    // exist.
+    auto const bookmark = ripple::keylet::nftpage(
+        ripple::keylet::nftpage_min(dbResponse.owner), dbResponse.tokenID);
+    auto const last = ripple::keylet::nftpage_max(dbResponse.owner);
+
+    ripple::uint256 nextKey = last.key;
+    std::optional<ripple::STLedgerEntry> sle;
+
+    // when this loop terminates, `sle` will contain the correct page for
+    // this NFT.
+    //
+    // 1) We start at the last NFTokenPage, which is guaranteed to exist,
+    // grab the object from the DB and deserialize it.
+    //
+    // 2) If that NFTokenPage has a PreviousPageMin value and the
+    // PreviousPageMin value is > bookmark, restart loop. Otherwise
+    // terminate and use the `sle` from this iteration.
+    do
+    {
+        auto const blob = backend.fetchLedgerObject(
+            ripple::Keylet(ripple::ltNFTOKEN_PAGE, nextKey).key,
+            dbResponse.ledgerSequence,
+            yield);
+
+        if (!blob || blob->size() == 0)
+            return Status{
+                Error::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
+
+        sle = ripple::STLedgerEntry(
+            ripple::SerialIter{blob->data(), blob->size()}, nextKey);
+
+        if (sle->isFieldPresent(ripple::sfPreviousPageMin))
+            nextKey = sle->getFieldH256(ripple::sfPreviousPageMin);
+
+    } while (sle && sle->key() != nextKey && nextKey > bookmark.key);
+
+    if (!sle)
+        return Status{
+            Error::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
+
+    auto const nfts = sle->getFieldArray(ripple::sfNFTokens);
+    auto const nft = std::find_if(
+        nfts.begin(),
+        nfts.end(),
+        [&dbResponse](ripple::STObject const& candidate) {
+            return candidate.getFieldH256(ripple::sfNFTokenID) ==
+                dbResponse.tokenID;
+        });
+
+    if (nft == nfts.end())
+        return Status{
+            Error::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
+
+    ripple::Blob const uriField = nft->getFieldVL(ripple::sfURI);
+
+    // NOTE this cannot use a ternary or value_or because then the
+    // expression's type is unclear. We want to explicitly set the `uri`
+    // field to null when not present to avoid any confusion.
+    if (std::string const uri = std::string(uriField.begin(), uriField.end());
+        uri.size() > 0)
+        return uri;
+    return std::monostate{};
+}
+
 static void
 doNFTWrite(
     std::vector<NFTsData>& nfts,
     Backend::CassandraBackend& backend,
-    std::string const tag)
+    std::string const tag,
+    boost::asio::yield_context& yield)
 {
     if (nfts.size() <= 0)
         return;
@@ -195,7 +266,7 @@ doMigration(
                 std::get<1>(getNFTDataFromTx(txMeta, sttx)).value());
         }
 
-        doNFTWrite(toWrite, backend, "TX");
+        doNFTWrite(toWrite, backend, "TX", yield);
 
         morePages = cass_result_has_more_pages(result);
         if (morePages)
@@ -226,7 +297,7 @@ doMigration(
                 ledgerRange->minSequence,
                 ripple::to_string(object.key),
                 std::string(object.blob.begin(), object.blob.end()));
-            doNFTWrite(toWrite, backend, "OBJ");
+            doNFTWrite(toWrite, backend, "OBJ", yield);
         }
         cursor = page.cursor;
     } while (cursor.has_value());
