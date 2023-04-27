@@ -22,16 +22,16 @@ wait(boost::asio::steady_timer& timer, std::string const reason)
     BOOST_LOG_TRIVIAL(info) << "Done";
 }
 
-std::variant<std::monostate, std::string, Status>
-getURI(Backend::NFT const& dbResponse, Backend::CassandraBackend& backend,  boost::asio::yield_context& yield)
+std::variant<Blob, Status>
+getURI(NFTsData const& nft, Backend::CassandraBackend& backend,  boost::asio::yield_context& yield)
 {
     // Fetch URI from ledger
     // The correct page will be > bookmark and <= last. We need to calculate
     // the first possible page however, since bookmark is not guaranteed to
     // exist.
     auto const bookmark = ripple::keylet::nftpage(
-        ripple::keylet::nftpage_min(dbResponse.owner), dbResponse.tokenID);
-    auto const last = ripple::keylet::nftpage_max(dbResponse.owner);
+        ripple::keylet::nftpage_min(nft.owner), nft.tokenID);
+    auto const last = ripple::keylet::nftpage_max(nft.owner);
 
     ripple::uint256 nextKey = last.key;
     std::optional<ripple::STLedgerEntry> sle;
@@ -49,7 +49,7 @@ getURI(Backend::NFT const& dbResponse, Backend::CassandraBackend& backend,  boos
     {
         auto const blob = backend.fetchLedgerObject(
             ripple::Keylet(ripple::ltNFTOKEN_PAGE, nextKey).key,
-            dbResponse.ledgerSequence,
+            nft.ledgerSequence,
             yield);
 
         if (!blob || blob->size() == 0)
@@ -72,9 +72,9 @@ getURI(Backend::NFT const& dbResponse, Backend::CassandraBackend& backend,  boos
     auto const nft = std::find_if(
         nfts.begin(),
         nfts.end(),
-        [&dbResponse](ripple::STObject const& candidate) {
+        [&nft](ripple::STObject const& candidate) {
             return candidate.getFieldH256(ripple::sfNFTokenID) ==
-                dbResponse.tokenID;
+                nft.tokenID;
         });
 
     if (nft == nfts.end())
@@ -83,13 +83,31 @@ getURI(Backend::NFT const& dbResponse, Backend::CassandraBackend& backend,  boos
 
     ripple::Blob const uriField = nft->getFieldVL(ripple::sfURI);
 
-    // NOTE this cannot use a ternary or value_or because then the
-    // expression's type is unclear. We want to explicitly set the `uri`
-    // field to null when not present to avoid any confusion.
-    if (std::string const uri = std::string(uriField.begin(), uriField.end());
-        uri.size() > 0)
-        return uri;
-    return std::monostate{};
+    return uriField;
+}
+
+verifyNFTs(std::vector<NFTsData>& nfts, Backend::CassandraBackend& backend, boost::asio::yield_context& yield){
+    for(auto const& nft: nfts){
+        std::optional<NFT> writtenNFT = backend.fetchNFT(nft.tokenID, nft.ledgerSequence, yield);
+        
+        if(!writtenNFT.has_value())
+            throw std::runtime_error("NFT is not written!");
+        
+        Blob writtenUriStr = writtenNFT->uri;
+        std::string writtenUriStr = strHex(writtenNFT->uri);
+
+        auto fetchOldUri = getURI(nft, backend, yield);
+        
+        Blob oldUriBlob;
+        // An error occurred
+        if (Status const* status = std::get_if<Status>(&fetchOldUri); status)
+            throw std::runtime_error("fetching old URI went wrong!");
+        // A URI was found
+        if (Blob const* uri = std::get_if<Blob>(&fetchOldUri); uri)
+            oldUriBlob = *uri;
+
+
+    }
 }
 
 static void
