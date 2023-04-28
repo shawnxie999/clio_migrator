@@ -3,13 +3,13 @@
 #include <config/Config.h>
 #include <etl/NFTHelpers.h>
 #include <main/Build.h>
-
+#include <rpc/Errors.h>
 #include <boost/asio.hpp>
 #include <boost/log/trivial.hpp>
 #include <cassandra.h>
 
 #include <iostream>
-
+using Blob = std::vector<unsigned char>;
 static std::uint32_t const MAX_RETRIES = 5;
 static std::chrono::seconds const WAIT_TIME = std::chrono::seconds(60);
 
@@ -22,7 +22,7 @@ wait(boost::asio::steady_timer& timer, std::string const reason)
     BOOST_LOG_TRIVIAL(info) << "Done";
 }
 
-std::variant<Blob, Status>
+static std::variant<Blob, RPC::Status>
 getURI(NFTsData const& nft, Backend::CassandraBackend& backend,  boost::asio::yield_context& yield)
 {
     // Fetch URI from ledger
@@ -53,8 +53,8 @@ getURI(NFTsData const& nft, Backend::CassandraBackend& backend,  boost::asio::yi
             yield);
 
         if (!blob || blob->size() == 0)
-            return Status{
-                Error::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
+            return RPC::Status{
+                RPC::RippledError::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
 
         sle = ripple::STLedgerEntry(
             ripple::SerialIter{blob->data(), blob->size()}, nextKey);
@@ -65,11 +65,11 @@ getURI(NFTsData const& nft, Backend::CassandraBackend& backend,  boost::asio::yi
     } while (sle && sle->key() != nextKey && nextKey > bookmark.key);
 
     if (!sle)
-        return Status{
-            Error::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
+        return RPC::Status{
+            RPC::RippledError::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
 
     auto const nfts = sle->getFieldArray(ripple::sfNFTokens);
-    auto const nft = std::find_if(
+    auto const findNft = std::find_if(
         nfts.begin(),
         nfts.end(),
         [&nft](ripple::STObject const& candidate) {
@@ -77,36 +77,38 @@ getURI(NFTsData const& nft, Backend::CassandraBackend& backend,  boost::asio::yi
                 nft.tokenID;
         });
 
-    if (nft == nfts.end())
-        return Status{
-            Error::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
+    if (findNft == nfts.end())
+        return RPC::Status{
+            RPC::RippledError::rpcINTERNAL, "Cannot find NFTokenPage for this NFT"};
 
-    ripple::Blob const uriField = nft->getFieldVL(ripple::sfURI);
+    ripple::Blob const uriField = findNft->getFieldVL(ripple::sfURI);
 
     return uriField;
 }
 
+static void 
 verifyNFTs(std::vector<NFTsData>& nfts, Backend::CassandraBackend& backend, boost::asio::yield_context& yield){
     for(auto const& nft: nfts){
-        std::optional<NFT> writtenNFT = backend.fetchNFT(nft.tokenID, nft.ledgerSequence, yield);
+        std::optional<Backend::NFT> writtenNFT = backend.fetchNFT(nft.tokenID, nft.ledgerSequence, yield);
         
         if(!writtenNFT.has_value())
             throw std::runtime_error("NFT is not written!");
         
-        Blob writtenUriStr = writtenNFT->uri;
-        std::string writtenUriStr = strHex(writtenNFT->uri);
+        Blob writtenUriBlob = writtenNFT->uri;
+        std::string writtenUriStr = ripple::strHex(writtenUriBlob);
 
         auto fetchOldUri = getURI(nft, backend, yield);
         
-        Blob oldUriBlob;
+        std::string oldUriStr;
         // An error occurred
-        if (Status const* status = std::get_if<Status>(&fetchOldUri); status)
+        if (RPC::Status const* status = std::get_if<RPC::Status>(&fetchOldUri); status)
             throw std::runtime_error("fetching old URI went wrong!");
         // A URI was found
         if (Blob const* uri = std::get_if<Blob>(&fetchOldUri); uri)
-            oldUriBlob = *uri;
+            oldUriStr = ripple::strHex(*uri);
 
-
+        if(oldUriStr.compare(writtenUriStr) != 0)
+            throw std::runtime_error("URIs don't match!");
     }
 }
 
@@ -122,6 +124,7 @@ doNFTWrite(
     auto const size = nfts.size();
     backend.writeNFTs(std::move(nfts));
     backend.sync();
+    verifyNFTs(nfts, backend, yield);
     BOOST_LOG_TRIVIAL(info) << tag << ": Wrote " << size << " records";
 }
 
