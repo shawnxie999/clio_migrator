@@ -101,14 +101,24 @@ verifyNFTs(std::vector<NFTsData>& nfts, Backend::CassandraBackend& backend, boos
         
         std::string oldUriStr;
         // An error occurred
-        if (RPC::Status const* status = std::get_if<RPC::Status>(&fetchOldUri); status)
+        if (RPC::Status const* status = std::get_if<RPC::Status>(&fetchOldUri); status){
+            BOOST_LOG_TRIVIAL(info) <<"\nNFTokenID "<< to_string(nft.tokenID) << "\n";
+            BOOST_LOG_TRIVIAL(info) <<"Owner "<< ripple::toBase58(nft.owner) << "\n";
+            BOOST_LOG_TRIVIAL(info) <<"Ldgr Seq "<< nft.ledgerSequence << "\n";
             throw std::runtime_error("fetching old URI went wrong!");
+        }
         // A URI was found
         if (Blob const* uri = std::get_if<Blob>(&fetchOldUri); uri)
             oldUriStr = ripple::strHex(*uri);
 
-        if(oldUriStr.compare(writtenUriStr) != 0)
+        if(oldUriStr.compare(writtenUriStr) != 0){
+            BOOST_LOG_TRIVIAL(info) <<"\nNFTokenID "<< to_string(nft.tokenID) << " did not match URIs!\n";  
             throw std::runtime_error("URIs don't match!");
+        }
+        else{
+            BOOST_LOG_TRIVIAL(info) <<"\nNFTokenID "<< to_string(nft.tokenID) << " URI migrated!\n";         
+        }
+
     }
 }
 
